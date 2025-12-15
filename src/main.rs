@@ -1,77 +1,42 @@
-use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio_tungstenite::accept_async;
+use futures_util::{StreamExt, SinkExt};
 
-use actix::{Actor, StreamHandler};
-use actix_web::{App, Error, HttpRequest, HttpResponse, HttpServer, web};
-use actix_web_actors::ws;
+#[tokio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:8080")
+        .await
+        .expect("Failed to bind");
 
-struct WsConn{
-    hb:Instant
-}
+    println!("🚀 WebSocket server running on ws://127.0.0.1:8080");
 
-impl Actor for WsConn{
-    type Context = ws::WebsocketContext<Self>;
-    fn started(&mut self, ctx: &mut Self::Context) {
-        self.hb=Instant::now();
-        self.start_heartbeat(ctx);
-        print!("Client Connected");
-    }
-    fn stopped(&mut self, _: &mut Self::Context) {
-        println!("Client disconnected");
-    }
-}
+    while let Ok((stream, addr)) = listener.accept().await {
+        println!("New connection from {}", addr);
 
-impl WsConn{
-    fn start_heartbeat(&self,ctx:&mut ws::WebsocketContext<Self>){
-        ctx.run_interval(Duration::from_secs(5),|act,ctx|{
-            if Instant::now().duration_since(self.hb)>Duration::from_secs(10){
-                println!("Heartbeat failed,diconnecting");
-                ctx.stop();
-                return;
+        tokio::spawn(async move {
+            let ws_stream = match accept_async(stream).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    eprintln!("WebSocket error: {}", e);
+                    return;
+                }
+            };
+
+            let (mut write, mut read) = ws_stream.split();
+
+            while let Some(msg) = read.next().await {
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+
+                if msg.is_text() {
+                    
+                    write.send(msg).await.unwrap();
+                }
             }
-            ctx.ping(b"ping");
+
+            println!("Connection closed: {}", addr);
         });
     }
-}
-
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsConn {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Ping(msg)) => {
-                self.hb = Instant::now();
-                ctx.pong(&msg);
-            }
-
-            Ok(ws::Message::Pong(_)) => {
-                self.hb = Instant::now();
-            }
-
-            Ok(ws::Message::Text(text)) => {
-                println!("Received: {}", text);
-                ctx.text(format!("Echo: {}", text));
-            }
-
-            Ok(ws::Message::Close(reason)) => {
-                ctx.close(reason);
-                ctx.stop();
-            }
-
-            _ => {}
-        }
-    }
-}
-
-
-async fn ws_route(req:HttpRequest,stream:web::Payload)->Result<HttpResponse,Error>{
-    ws::start(WsConn{hb:Instant::now()}, &req, stream)
-}
-
-#[actix_web::main]
-async fn main ()->std::io::Result<()>{
-    HttpServer::new(||{
-        App::new()
-        .route("/ws", web::get().to(ws_route))
-    })
-    .bind(("127.0.0.1",8080))?
-    .run()
-    .await
 }
