@@ -1,35 +1,33 @@
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
-use tokio_tungstenite::accept_async;
+use std::{net::TcpStream, sync::Arc};
 
-//this is where the main program starts 
-const PORT :&str = "127.0.0.1:8080";
+use anyhow::Result;
+use tokio::{net::TcpListener, sync::{Mutex, mpsc}};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+type Tx = mpsc::UnboundedSender<Message>;
+type Rx= mpsc::UnboundedReceiver<Message>;
+
 #[tokio::main]
-async fn main (){
-    let listener = TcpListener::bind(PORT).await.expect("Could not find the port");
-    println!("Listener started on : {}",PORT);
-    while let Ok((stream,addr)) = listener.accept().await {
-        println!("Connection started at : {}",addr);
+async fn main ()->Result<()>{
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    println!("the listener is working at : {}",addr);
 
+    let waiting_client = Arc<Mutex<Option<Tx>>>= Arc::new(Mutex::new(None));
+    loop {
+        let (stream,peer) = listener.accept().await?;
+        println!("Client connected : {}",peer);
+        let waiting_client = waiting_client.clone();
         tokio::spawn(async move{
-            let ws_stream = match accept_async(stream).await {
-                Ok(ws)=>ws,
-                Err(e)=>{
-                    eprintln!("Websocket error : {}",e.to_string());
-                    return;
-                }
-            };
-            let (mut write,mut read)= ws_stream.split();
-            while let Some(msg) =read.next().await  {
-                let msg = match msg {
-                    Ok(m)=>m,
-                    Err(_)=>break,
-                };
-                if msg.is_text(){
-                    write.send(msg).await.unwrap();
-                }
-            }
-            println!("Connection closed : {}",addr);
+            if let Err(e) =handle_client(stream,waiting_client).await{
+                eprintln!("Error: {}",e);
+            } 
         });
     }
 }
+async fn handle_client(stream:TcpStream,waiting_client:Arc<Mutex<Option<Tx>>>)->Result<()>{
+    let ws = accept_async(stream).await?;
+    let (mut write,mut read) = ws.split();
+    let (tx,mut rx):(Tx,Rx)= mpsc::unbounded_channel();
+}
+
