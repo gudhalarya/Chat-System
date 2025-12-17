@@ -104,4 +104,4 @@ For issues, questions, or suggestions, please open an [issue](https://github.com
 
 ---
 
-Built with ❤️ in Rust
+Built in Rust
