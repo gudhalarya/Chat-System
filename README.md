@@ -96,8 +96,8 @@ This project is open source and available under the MIT License.
 
 ## Author
 
-**Aditya Gudhal** - [@gudhalarya](https://github.com/gudhalarya)
-
+**Gudhal Chauhan** - [@gudhalarya](https://github.com/gudhalarya)
+**Webiste** - [@Website](https://draken.blog)
 ## Support
 
 For issues, questions, or suggestions, please open an [issue](https://github.com/gudhalarya/Chat-System/issues) on the repository.
