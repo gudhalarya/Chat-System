@@ -1,8 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use tokio::{net::TcpListener, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}}};
-use tokio_tungstenite::tungstenite::Message;
+use futures_util::StreamExt;
+use tokio::{net::{TcpListener, TcpStream}, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}}};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+use uuid::Uuid;
 
 type Tx= UnboundedSender<Message>;
 type Rx = UnboundedReceiver<Message>;
@@ -30,4 +32,26 @@ async fn main ()->Result<()>{
             }
         });
     }
+}
+
+async fn handle_client(stream:TcpStream,rooms:Rooms)->Result<()>{
+    let ws = accept_async(stream).await?;
+    let (_write,_read) = ws.split();
+    let (tx, _rx) :(Tx,Rx) = unbounded_channel();
+    let room_id = create_or_join_room_id(tx,rooms.clone()).await?;
+    println!("Client joined the room : {}",room_id);
+
+    Ok(()) 
+}
+
+async fn create_or_join_room_id(tx:Tx,rooms:Rooms)->Result<()>{
+    let mut rooms = rooms.lock().await;
+    let room_id = Uuid::new_v4().to_string();
+    let room = RoomsType{
+        id:room_id.clone(),
+        clients:vec![tx],
+    };
+
+    rooms.insert(room_id.clone(),room);
+    Ok(room_id)
 }
