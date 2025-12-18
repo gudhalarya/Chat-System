@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use futures_util::{StreamExt, TryFutureExt};
+use futures_util::{SinkExt, StreamExt, TryFutureExt};
 use tokio::{net::{TcpListener, TcpStream}, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}}, time::Instant};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
@@ -63,11 +63,19 @@ async fn cleanup_rooms(roomstype:RoomType){
     roomstype.retain(|_,room|!room.clients.is_empty());
 }
 
-//this is where the logic of fucking hanlde_client is ------fuck you mother fucker
+async fn broadcast_to_room(room_id:&str,roomstype:RoomType,msg:Message){
+    let roomstype = roomstype.lock().await;
+    if let Some(room) = roomstype.get(room_id){
+        for client in &room.clients{
+            let _ = client.send(msg.clone());
+        }
+    }
+}
+//this is where the logic of fucking hanlde_client is ------fuck you motherfucker
 async fn hanlde_client(stream:TcpStream,roomstype:RoomType)->Result<()>{
     let ws = accept_async(stream).await?;
-    let (_write,mut read) = ws.split();
-    let (tx,_rx) :(Tx,Rx)= unbounded_channel();
+    let (mut write,mut read) = ws.split();
+    let (tx,rx) :(Tx,Rx)= unbounded_channel();
 
     let first_msg = match read.next().await{
         Some(Ok(Message::Text(room_id)))=>room_id,
@@ -86,17 +94,35 @@ async fn hanlde_client(stream:TcpStream,roomstype:RoomType)->Result<()>{
     join_rooms(roomstype.clone(), &room_id, tx.clone()).map_err(|e|anyhow::anyhow!(e));
     println!("Client joined the room : {}",room_id);
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Close(_))=>break,
-            Ok(_)=>{},
+    let write_task=tokio::spawn(async move {
+        while let Some(msg) =rx.recv().await  {
+            if write.send(msg).await.is_err(){
+                break;
+            }
+        }
+    });
+
+
+    while let Some(msg) = read.next().await{
+        match msg{
+            Ok(Message::Text(text))=>{
+                let message = Message::Text(text);
+                broadcast_to_room(&room_id,roomstype.clone(),message).await;
+            }
+            Ok(Message::Binary(bin))=>{
+                let message = Message::Binary(bin);
+                broadcast_to_room(&room_id,roomstype.clone(),message).await;
+            }
             Err(_)=>break,
+            _=>{}
         }
     }
+   
 
     println!("Client left the room");
     leave_rooms(roomstype.clone(), &room_id, &tx).await;
     cleanup_rooms(roomstype).await;
+    write_task.abort();
     Ok(())
 
 }
