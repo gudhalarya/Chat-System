@@ -1,149 +1,265 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt, TryFutureExt};
-use tokio::{net::{TcpListener, TcpStream}, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}}, time::Instant};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        Mutex,
+    },
+    time::Instant,
+};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
+// ===================== TYPES =====================
+
 type Tx = UnboundedSender<Message>;
 type Rx = UnboundedReceiver<Message>;
-const MAX_ROOM_SIZE :usize = 15;
-type RoomType = Arc<Mutex<HashMap<String,RoomDs>>>;
-struct RoomDs{
-    id:String,
-    clients:Vec<Tx>,
-    created_at:Instant,
-    last_active:Instant,
-    is_open:bool,
+type Rooms = Arc<Mutex<HashMap<String, Room>>>;
+
+const MAX_ROOM_CLIENTS: usize = 15;
+
+// ===================== ROOM STRUCT =====================
+
+struct Room {
+    id: String,
+    created_at: Instant,
+    last_active: Instant,
+    is_open: bool,
+    clients: Vec<Tx>,
 }
 
-//this is where the fucking room logic is --------
-async fn create_rooms(roomtype:RoomType)->String{
-    let mut roomtype = roomtype.lock().await;
-    let id = Uuid::new_v4().to_string();
-    let now = Instant::now();
-    let room = RoomDs{
-        id:id.clone(),
-        created_at:now,
-        last_active:now,
-        is_open:true,
-        clients:Vec::new(),
-    };
-    roomtype.insert(id.clone(), room);
-    id
+// ===================== JSON PROTOCOL =====================
+
+// Client → Server
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ClientMessage {
+    #[serde(rename = "create_room")]
+    CreateRoom,
+
+    #[serde(rename = "join_room")]
+    JoinRoom { room_id: String },
+
+    #[serde(rename = "message")]
+    Message { text: String },
 }
 
-async fn join_rooms(roomstype:RoomType,room_id:&str,tx:Tx)->Result<(),&'static str>{
-    let mut roomstype = roomstype.lock().await;
-    let room = roomstype.get_mut(room_id).ok_or("Room is not found")?;
-    if !room.is_open{
-        return Err("Room is closed");
+// Server → Client
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ServerMessage {
+    #[serde(rename = "room_created")]
+    RoomCreated { room_id: String },
+
+    #[serde(rename = "joined_room")]
+    JoinedRoom { room_id: String },
+
+    #[serde(rename = "room_message")]
+    RoomMessage { room_id: String, text: String },
+
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+// ===================== MAIN =====================
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let addr = "127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    println!("✅ Server running at ws://{}", addr);
+
+    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        println!("🔌 New connection from {}", peer);
+
+        let rooms = rooms.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(stream, rooms).await {
+                eprintln!("❌ Client error: {}", e);
+            }
+        });
     }
-
-    if room.clients.len()>MAX_ROOM_SIZE{
-        return Err("Room is already full");
-    }
-
-    room.clients.push(tx);
-    room.last_active= Instant::now();
-    Ok(())
 }
 
-async fn leave_rooms(roomtype:RoomType,room_id:&str,tx:&Tx){
-    let mut roomtype = roomtype.lock().await;
-    if let Some(room) = roomtype.get_mut(room_id){
-        room.clients.retain(|client|!client.same_channel(tx));
-        room.last_active= Instant::now();
-    }
-}
+// ===================== CLIENT HANDLER =====================
 
-async fn cleanup_rooms(roomstype:RoomType){
-    let mut roomstype = roomstype.lock().await;
-    roomstype.retain(|_,room|!room.clients.is_empty());
-}
-
-async fn broadcast_to_room(room_id:&str,roomstype:RoomType,msg:Message){
-    let roomstype = roomstype.lock().await;
-    if let Some(room) = roomstype.get(room_id){
-        for client in &room.clients{
-            let _ = client.send(msg.clone());
-        }
-    }
-}
-//this is where the logic of fucking hanlde_client is ------fuck you motherfucker
-async fn hanlde_client(stream:TcpStream,roomstype:RoomType)->Result<()>{
+async fn handle_client(stream: TcpStream, rooms: Rooms) -> Result<()> {
     let ws = accept_async(stream).await?;
-    let (mut write,mut read) = ws.split();
-    let (tx,rx) :(Tx,Rx)= unbounded_channel();
+    let (mut write, mut read) = ws.split();
 
-    let first_msg = match read.next().await{
-        Some(Ok(Message::Text(room_id)))=>room_id,
-        _=>return Ok(())
-    };
-    let room_id = if first_msg=="CREATE"{
-        let id = create_rooms(roomstype.clone()).await;
-        println!("Room is created id is : {}",id);
-        id
-    }
-    else {
-        first_msg
-    };
+    let (tx, rx): (Tx, Rx) = unbounded_channel();
 
-    //now let us help this bitch to join a room
-    join_rooms(roomstype.clone(), &room_id, tx.clone()).map_err(|e|anyhow::anyhow!(e));
-    println!("Client joined the room : {}",room_id);
-
-    let write_task=tokio::spawn(async move {
-        while let Some(msg) =rx.recv().await  {
-            if write.send(msg).await.is_err(){
+    // ---- WRITE TASK ----
+    let write_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if write.send(msg).await.is_err() {
                 break;
             }
         }
     });
 
+    // ---- FIRST MESSAGE (CREATE / JOIN) ----
+    let first_text = match read.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        _ => return Ok(()),
+    };
 
-    while let Some(msg) = read.next().await{
-        match msg{
-            Ok(Message::Text(text))=>{
-                let message = Message::Text(text);
-                broadcast_to_room(&room_id,roomstype.clone(),message).await;
+    let first_msg: ClientMessage = match serde_json::from_str(&first_text) {
+        Ok(msg) => msg,
+        Err(_) => {
+            send_error(&tx, "Invalid JSON").await;
+            return Ok(());
+        }
+    };
+
+    let room_id = match first_msg {
+        ClientMessage::CreateRoom => {
+            let id = create_room(rooms.clone()).await;
+            send_json(
+                &tx,
+                ServerMessage::RoomCreated {
+                    room_id: id.clone(),
+                },
+            )
+            .await;
+            id
+        }
+
+        ClientMessage::JoinRoom { room_id } => {
+            join_room(&room_id, rooms.clone(), tx.clone())
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            send_json(
+                &tx,
+                ServerMessage::JoinedRoom {
+                    room_id: room_id.clone(),
+                },
+            )
+            .await;
+            room_id
+        }
+
+        _ => {
+            send_error(&tx, "Invalid first message").await;
+            return Ok(());
+        }
+    };
+
+    println!("👥 Client joined room {}", room_id);
+
+    // ---- READ LOOP (MESSAGING) ----
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(ClientMessage::Message { text }) =
+                    serde_json::from_str::<ClientMessage>(&text)
+                {
+                    let server_msg = ServerMessage::RoomMessage {
+                        room_id: room_id.clone(),
+                        text,
+                    };
+
+                    broadcast_to_room(
+                        &room_id,
+                        rooms.clone(),
+                        Message::Text(serde_json::to_string(&server_msg)?),
+                    )
+                    .await;
+                }
             }
-            Ok(Message::Binary(bin))=>{
-                let message = Message::Binary(bin);
-                broadcast_to_room(&room_id,roomstype.clone(),message).await;
-            }
-            Err(_)=>break,
-            _=>{}
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
         }
     }
-   
 
-    println!("Client left the room");
-    leave_rooms(roomstype.clone(), &room_id, &tx).await;
-    cleanup_rooms(roomstype).await;
+    // ---- CLEANUP ----
+    println!("❌ Client left room {}", room_id);
+    leave_room(&room_id, rooms.clone(), &tx).await;
+    cleanup_empty_rooms(rooms).await;
+
     write_task.abort();
     Ok(())
-
 }
 
+// ===================== ROOM LOGIC =====================
 
-#[tokio::main]
-async fn main ()->Result<()>{
-    let addr = "127.0.0.1:8080";
-    let listener = TcpListener::bind(addr).await?;
-    println!("The srever has started at : {}",addr);
+async fn create_room(rooms: Rooms) -> String {
+    let id = Uuid::new_v4().to_string();
+    let now = Instant::now();
 
-    let rooms:RoomType = Arc::new(Mutex::new(HashMap::new()));
-    loop {
-        let (stream,peer) = listener.accept().await?;
-        println!("New connection at : {}",peer);
-        let rooms = rooms.clone();
-        tokio::spawn(async move {
-            if let Err(e)=hanlde_client(stream, rooms).await{
-                eprintln!("Error is there : {}",e);
-            }
-        });
+    let room = Room {
+        id: id.clone(),
+        created_at: now,
+        last_active: now,
+        is_open: true,
+        clients: Vec::new(),
+    };
+
+    rooms.lock().await.insert(id.clone(), room);
+    id
+}
+
+async fn join_room(room_id: &str, rooms: Rooms, tx: Tx) -> Result<(), &'static str> {
+    let mut rooms = rooms.lock().await;
+    let room = rooms.get_mut(room_id).ok_or("Room not found")?;
+
+    if !room.is_open {
+        return Err("Room is closed");
     }
 
+    if room.clients.len() >= MAX_ROOM_CLIENTS {
+        return Err("Room is full");
+    }
+
+    room.clients.push(tx);
+    room.last_active = Instant::now();
+    Ok(())
+}
+
+async fn leave_room(room_id: &str, rooms: Rooms, tx: &Tx) {
+    let mut rooms = rooms.lock().await;
+    if let Some(room) = rooms.get_mut(room_id) {
+        room.clients.retain(|c| !c.same_channel(tx));
+        room.last_active = Instant::now();
+    }
+}
+
+async fn cleanup_empty_rooms(rooms: Rooms) {
+    let mut rooms = rooms.lock().await;
+    rooms.retain(|_, room| !room.clients.is_empty());
+}
+
+// ===================== HELPERS =====================
+
+async fn broadcast_to_room(room_id: &str, rooms: Rooms, msg: Message) {
+    let rooms = rooms.lock().await;
+    if let Some(room) = rooms.get(room_id) {
+        for client in &room.clients {
+            let _ = client.send(msg.clone());
+        }
+    }
+}
+
+async fn send_json(tx: &Tx, msg: ServerMessage) {
+    let _ = tx.send(Message::Text(
+        serde_json::to_string(&msg).unwrap(),
+    ));
+}
+
+async fn send_error(tx: &Tx, message: &str) {
+    send_json(
+        tx,
+        ServerMessage::Error {
+            message: message.to_string(),
+        },
+    )
+    .await;
 }
