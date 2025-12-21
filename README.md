@@ -105,3 +105,5 @@ For issues, questions, or suggestions, please open an [issue](https://github.com
 ---
 
 Built in Rust
+## Important Info 
+I am thinking if making the backend of thsi project in some framework made in rust though i dont know much about that so we will see.
