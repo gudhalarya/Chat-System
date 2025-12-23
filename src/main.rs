@@ -1,49 +1,31 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use tokio::{net::TcpListener, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender}}, task::id, time::Instant};
-use tokio_tungstenite::tungstenite::{Message, handshake::server::ErrorResponse};
+use futures_util::StreamExt;
+use tokio::{net::{TcpListener, TcpStream}, sync::{Mutex, mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel}}, time::Instant};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 use serde::{Deserialize,Serialize};
 
 type Tx = UnboundedSender<Message>;
-type Rx = UnboundedReceiver<Message>;
-type Roomtype = Arc<Mutex<HashMap<String,RoomDs>>>;
-const MAX_ROOM_SIZE :usize= 15;
+type Rx =UnboundedReceiver<Message>;
+type RoomType=Arc<Mutex<HashMap<String,RoomDs>>>;
+const MAX_ROOM_SIZE:usize=15;
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ClientMessage {
+    #[serde(rename = "hello")]
+    Hello { username: String },
 
-struct RoomDs{
-    id:String,
-    created_at:Instant,
-    last_active:Instant,
-    is_open:bool,
-    clients:Vec<Clients>,
-}
+    #[serde(rename = "create_room")]
+    CreateRoom,
 
-#[derive(Clone)]
-struct Clients{
-    id:Uuid,
-    username:String,
-    tx:Tx,
-}
+    #[serde(rename = "join_room")]
+    JoinRoom { room_id: String },
 
-//json protocol is here you bitch 
-//from clients to server -------------->
-
-#[derive(Debug,Deserialize)]
-#[serde(tag="type ")]
-enum ClinetsMessage{
-    #[serde(rename="hello")]
-    Hello {username:String},
-
-    #[serde(rename="create_room")]
-    CreateRoom ,
-
-    #[serde(rename="join_room")]
-    JoinRoom {room_id:String},
-
-    #[serde(rename="message")]
-    Message {text:String},
+    #[serde(rename = "message")]
+    Message { text: String },
 }
 
 // Server → Client
@@ -70,27 +52,60 @@ enum ServerMessage {
     Error { message: String },
 }
 
-//room logic is written here you fool
-async fn create_room(roomtype:Roomtype)->String{
-    let room_id=Uuid::new_v4().to_string();
-    let mut roomtype = roomtype.lock().await;
+
+struct RoomDs{
+    id:String,
+    is_open:bool,
+    last_active:Instant,
+    created_at:Instant,
+    clients:Vec<Clients>,
+}
+
+#[derive(Debug,Clone)]
+struct Clients{
+    id:Uuid,
+    username:String,
+}
+
+#[tokio::main]
+async fn main()->Result<()>{
+    let addr ="127.0.0.1:8080";
+    let listener = TcpListener::bind(addr).await?;
+    println!("Server started at : {}",addr);
+    let roomtype:RoomType =Arc::new(Mutex::new(HashMap::new()));
+    loop {
+        let (stream,peer) = listener.accept().await?;
+        println!("New connection at :{}",peer);
+        let roomtype = roomtype.clone();
+        tokio::spawn(async move{
+            if let Err(e)=handle_client(stream,roomtype).await{
+                eprintln!("Error is :{}",e);
+            }
+        });
+    }
+}
+
+//this is where the room logic is ---------->
+async fn create_room(roomtype:RoomType)->String{
+    let id =Uuid::new_v4().to_string();
     let now = Instant::now();
+    let mut roomtype = roomtype.lock().await;
     let room = RoomDs{
-        id:room_id.clone(),
+        id:id.clone(),
         is_open:true,
         last_active:now,
         created_at:now,
         clients:Vec::new(),
     };
-    roomtype.insert(room_id.clone(), room);
-    room_id
+    roomtype.insert(id.clone(), room);
+    id
 }
 
-async fn join_room(client:Clients,room_id:&str,roomtype:Roomtype)->Result<(),&'static str>{
+async fn join_room(roomtype:RoomType,room_id:&str,client:Clients)->Result<(),&'static str>{
     let mut roomtype = roomtype.lock().await;
-    let room = roomtype.get_mut(room_id).ok_or("room is not found")?;
+    let room = roomtype.get_mut(room_id).ok_or("Room not found")?;
     if !room.is_open{
-        return Err("room is not open");
+        return Err("Room is closed");
     }
     if room.clients.len()>=MAX_ROOM_SIZE{
         return Err("Room is full");
@@ -100,43 +115,17 @@ async fn join_room(client:Clients,room_id:&str,roomtype:Roomtype)->Result<(),&'s
     Ok(())
 }
 
-async fn leave_room(room_id:&str,roomtype:Roomtype,user_id:&Uuid){
-    let mut roomstype = roomtype.lock().await;
-    if let Some(room) = roomstype.get_mut(room_id) {
-        room.clients.retain(|c|&c.id!=user_id);
+async fn leave_room(roomtype:RoomType,room_id:&str,user_id:&Uuid){
+    let mut roomtype = roomtype.lock().await;
+    if let Some(room)=roomtype.get_mut(room_id){
+        room.clients.retain(|c|&c.id != user_id);
         room.last_active=Instant::now();
     }
 }
 
-async fn cleanup_empty_room(roomtype:Roomtype){
+async fn cleanup_rooms(roomtype:RoomType){
     let mut roomtype = roomtype.lock().await;
     roomtype.retain(|_,room|!room.clients.is_empty());
-}
-
-async fn broadcast_to_rooms(roomtype:Roomtype,room_id:&str,msg:Message){
-    let roomtype = roomtype.lock().await;
-    if let Some(room)=roomtype.get(room_id){
-        for client in &room.clients{
-            let _ = client.tx.send(msg.clone());
-        }
-    }
-}
-
-//this is where the fn will be added ----later bitch 
-#[tokio::main]
-async fn main ()->Result<()>{
-    let addr = "127.0.0.1:8080";
-    let listener = TcpListener::bind(addr).await?;
-    let roomtype:Roomtype = Arc::new(Mutex::new(HashMap::new()));
-    loop {
-        let (stream,peer) = listener.accept().await?;
-        let roomtype = roomtype.clone();
-        tokio::spawn(async move {
-            if let Err(e)=handle_client(stream,roomtype){
-                eprintln!("Error is :{}",e);
-            }
-        });
-    }
 }
 
 
